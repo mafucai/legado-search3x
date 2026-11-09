@@ -1,0 +1,364 @@
+name: iOS Build
+
+# ⚠️ 手动触发不挂 push/PR: macOS runner 排队久 (标准 runner 在 public 仓库不计费,
+# 但每次 push 都占一个 macOS 槽位会拖慢其它构建)。
+# 本文件是 iOS 端唯一的编译入口 (从 klib 档到 link/ipa/simulator 全在这里), 需要时手动 dispatch。
+# 改 klib 任务名或 -PenableIosTarget=true 开关时, 只需同步本文件内的 stage 分支。
+# stage 控制深度, 调试 YAML/脚本语法时用 klib 即可, 不必每次跑完整 ipa。
+# iOS 不进 release.yml 流水线: 手动 dispatch 本 workflow, 产物由自带 publish job 发布到
+# multiplatform-test 测试 Release (真机 ipa 发包时重建 Release 使提交与排位刷到最新,
+# 模拟器包只追加), 供真机侧载与 ios-remote 拉取。
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: '构建深度: klib=只编 Kotlin iOS klib / link=编静态库+链接 framework / ipa=完整出未签名 ipa / simulator=出模拟器构建包'
+        required: true
+        default: 'ipa'
+        type: choice
+        options:
+          - klib
+          - link
+          - ipa
+          - simulator
+
+# 组名不能用 github.workflow: 本文件已无 workflow_call (不被其它工作流调用), 但这个 token
+# 在手动触发时就是本工作流名, 与下面拆 stage 的组名不是一路; 保留按 ref+stage 拆分的显式
+# 组名, 避免将来恢复 workflow_call 时又撞成调用方占组、被调用 job 等同一个组的死锁。
+concurrency:
+  # 组按 stage 拆分: 并行发起 ipa 与 simulator 两条构建腿时互不取消
+  group: ios-build-${{ github.ref }}-${{ inputs.stage }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # syncIosVersion 用 git rev-list HEAD --count 算 versionCode,
+          # shallow 下恒为 1 (与 test.yml 同款取版本方式, 两边必须一致)
+          fetch-depth: 0
+
+      - name: Set version
+        id: ver
+        # 手动触发无版本号入参, 恒按当前时间生成 (test.yml/release.yml 那套上游版本号不再传入)
+        run: |
+          v="${{ inputs.version }}"
+          [ -n "$v" ] || v="$(TZ=Asia/Shanghai date +3.%y.%m%d%H%M)"
+          echo "version=$v" >> $GITHUB_OUTPUT
+
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: 21
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+      - name: Gradle build-cache 共享
+        # key 必须每次运行唯一: GitHub 对已存在的 key 跳过保存, 固定 key 会让缓存自首次写入后永久冻结;
+        # 取用走 restore-keys 前缀 (同 OS 同分支最近一次), 与桌面 macOS 腿共享同一份缓存
+        uses: actions/cache@v5
+        with:
+          path: ~/.gradle/caches/build-cache-1
+          key: gradle-buildcache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          restore-keys: |
+            gradle-buildcache-${{ runner.os }}-${{ github.ref_name }}-
+            gradle-buildcache-${{ runner.os }}-
+
+      # ===== 环境诊断: 一次跑完就能定位环境类问题, 避免为查 SDK 路径再开一轮 =====
+      - name: Environment diagnostics
+        id: diag
+        continue-on-error: true
+        run: |
+          set -x
+          mkdir -p "$GITHUB_WORKSPACE/ci-logs"
+          exec > >(tee -a "$GITHUB_WORKSPACE/ci-logs/00-diagnostics.log") 2>&1
+          echo "===== stage = ${{ inputs.stage }} ====="
+          sw_vers || true
+          xcodebuild -version || true
+          xcode-select -p || true
+          xcrun --sdk iphoneos --show-sdk-path || true
+          xcrun --sdk iphoneos --show-sdk-version || true
+          xcrun --sdk iphonesimulator --show-sdk-path || true
+          xcrun --sdk iphoneos --find clang || true
+          java -version || true
+          df -h || true
+          sysctl -n hw.ncpu || true
+          echo "===== konan ====="
+          ls -la ~/.konan 2>/dev/null || echo "(no ~/.konan yet)"
+          grep -n "kotlin *=" gradle/libs.versions.toml || true
+
+      # Kotlin/Native 工具链 (~1GB) 缓存, 省掉每轮重新下载
+      - name: Cache Kotlin/Native toolchain
+        uses: actions/cache@v5
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: konan-${{ runner.os }}-
+
+      # 静态库只依赖 C 源与构建脚本, 命中即跳过 (quickjs.c 2MB, -O2 编译约 1~2 分钟)
+      - name: Cache iOS native static libs
+        id: cache-native
+        if: inputs.stage != 'klib'
+        uses: actions/cache@v5
+        with:
+          path: data/build/iosNativeLibs
+          key: ios-native-${{ runner.os }}-${{ hashFiles('modules/quickjs/src/main/cinterop/quickjs-ng/**', 'scripts/build-ios-native.sh') }}
+
+      - name: Build iOS native static libs (quickjs-ng)
+        id: native
+        if: inputs.stage != 'klib' && steps.cache-native.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p "$GITHUB_WORKSPACE/ci-logs"
+          chmod +x scripts/build-ios-native.sh
+          ./scripts/build-ios-native.sh ios_arm64 ios_simulator_arm64 2>&1 \
+            | tee "$GITHUB_WORKSPACE/ci-logs/10-build-ios-native.log"
+
+      - name: Verify static libs
+        if: inputs.stage != 'klib'
+        continue-on-error: true
+        run: |
+          set -x
+          ls -lR data/build/iosNativeLibs || true
+          for a in $(find data/build/iosNativeLibs -name '*.a'); do
+            lipo -info "$a" || true
+          done
+
+      # ===== Kotlin 侧编译 =====
+      # --continue: 一个 task 失败仍继续其他 task, 一轮拿到全部错误 (Kotlin 编译器本身也一次报全部错误)
+      - name: List iOS gradle tasks
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./gradlew :ui:tasks --all --console=plain 2>&1 \
+            | grep -i -E "ios|cinterop|framework" \
+            | tee "$GITHUB_WORKSPACE/ci-logs/20-ios-tasks.log" || true
+
+      - name: Compile shared iOS klib
+        id: klib
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          # klib 档用途是语法/类型校验, 与最终产物无关, 固定真机 target。
+          # 下面这套 --info/--continue 是手动作业的排查便利; 换 target 时与上面 stage
+          # 输入的可选值同步。
+          ./gradlew :ui:compileKotlinIosArm64 -PenableIosTarget=true \
+            --info --stacktrace --warning-mode all --continue --console=plain 2>&1 \
+            | tee "$GITHUB_WORKSPACE/ci-logs/30-compile-klib.log"
+
+      - name: Link shared framework
+        id: link
+        # stage=simulator 的 framework 由 xcodebuild 内部 Gradle 链接, 真机 framework 无用
+        if: inputs.stage != 'klib' && inputs.stage != 'simulator'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          if [ "${{ inputs.stage }}" = "ipa" ]; then
+            TASK=":ui:linkReleaseFrameworkIosArm64"
+          else
+            TASK=":ui:linkDebugFrameworkIosArm64"
+          fi
+          echo "===== gradle $TASK ====="
+          ./gradlew "$TASK" \
+            --info --stacktrace --warning-mode all --continue --console=plain 2>&1 \
+            | tee "$GITHUB_WORKSPACE/ci-logs/40-link-framework.log"
+          echo "===== framework 产物 ====="
+          find ui/build/bin -maxdepth 4 -name "*.framework" -exec ls -ld {} \; || true
+
+      # ===== ipa (未签名, 供 SideStore/AltStore/Xcode 自签侧载) =====
+      - name: Install XcodeGen
+        if: inputs.stage == 'ipa' || inputs.stage == 'simulator'
+        continue-on-error: true
+        run: brew install xcodegen
+
+      # 必须在 xcodegen generate 之前把版本号落进 project.yml/Info.plist。
+      # 不能只靠 iosApp 的 preBuildScript: 该阶段与 ProcessInfoPlistFile 并发,
+      # 写入落在 plist 处理之后, 产物里仍是 project.yml 里的占位值。
+      # 传 -PappVersion 用上游算好的版本号, 保证 bundle 版本 = ipa 文件名 = 安卓 versionName。
+      - name: Sync iOS version
+        id: syncver
+        if: inputs.stage == 'ipa' || inputs.stage == 'simulator'
+        run: ./gradlew syncIosVersion -PappVersion=${{ steps.ver.outputs.version }} --console=plain
+
+      - name: Generate Xcode project
+        if: inputs.stage == 'ipa' || inputs.stage == 'simulator'
+        continue-on-error: true
+        working-directory: iosApp/
+        run: |
+          set -o pipefail
+          xcodegen generate 2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/50-xcodegen.log"
+
+      # ===== 模拟器包 (stage=simulator, 供 multiplatform-test 与 ios-remote) =====
+      - name: Build for simulator
+        id: simbuild
+        if: inputs.stage == 'simulator'
+        continue-on-error: true
+        working-directory: iosApp/
+        run: |
+          set -o pipefail
+          # build (不是 archive): 模拟器要的是 iphonesimulator SDK 下的 .app。
+          # Debug 配置: 本仓只注册了 iosArm64/iosSimulatorArm64 (无 iosX64), Release 下
+          # xcodebuild 传 ARCHS="arm64 x86_64", Gradle 的 syncComposeResourcesForIos
+          # 直接报 Unknown iOS simulator arch; generic destination 无 active arch,
+          # 故显式钉 ARCHS=arm64, 不依赖 ONLY_ACTIVE_ARCH 的默认值。
+          xcodebuild build \
+            -project iosApp.xcodeproj \
+            -scheme iosApp \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build/simdd \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            LEGADO_APP_VERSION="${{ steps.ver.outputs.version }}" 2>&1 \
+            | tee "$GITHUB_WORKSPACE/ci-logs/70-xcodebuild-sim.log"
+
+      - name: Package simulator zip
+        id: simzip
+        if: inputs.stage == 'simulator'
+        continue-on-error: true
+        working-directory: iosApp/
+        run: |
+          set -ex
+          APPS_DIR=build/simdd/Build/Products/Debug-iphonesimulator
+          APP_PATH="$(find "$APPS_DIR" -maxdepth 1 -name '*.app' | head -1)"
+          test -n "$APP_PATH"
+          cd "$APPS_DIR"
+          zip -qry "$GITHUB_WORKSPACE/iosApp/build/legado-${{ steps.ver.outputs.version }}-ios-simulator.zip" "$(basename "$APP_PATH")"
+          ls -lh "$GITHUB_WORKSPACE/iosApp/build/"*-ios-simulator.zip
+
+      - name: Upload simulator artifact
+        if: inputs.stage == 'simulator'
+        uses: actions/upload-artifact@v6
+        with:
+          name: ios-simulator
+          path: ${{ github.workspace }}/iosApp/build/*-ios-simulator.zip
+          # 模拟器包是 multiplatform-test 的发布契约; 缺失或上传失败必须让工作流失败。
+          if-no-files-found: error
+
+      - name: Archive (unsigned)
+        id: archive
+        if: inputs.stage == 'ipa'
+        continue-on-error: true
+        working-directory: iosApp/
+        run: |
+          set -o pipefail
+          # 无 Apple 证书: 关掉全部签名。CODE_SIGN_STYLE=Manual 是为了绕开
+          # Automatic 在 DEVELOPMENT_TEAM 为空时的 "requires a development team" 报错。
+          xcodebuild archive \
+            -project iosApp.xcodeproj \
+            -scheme iosApp \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/iosApp.xcarchive \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            LEGADO_APP_VERSION="${{ steps.ver.outputs.version }}" 2>&1 \
+            | tee "$GITHUB_WORKSPACE/ci-logs/60-archive.log"
+
+      - name: Package unsigned IPA
+        id: ipa
+        if: inputs.stage == 'ipa'
+        continue-on-error: true
+        working-directory: iosApp/
+        run: |
+          set -ex
+          # 未签名 ipa 不走 xcodebuild -exportArchive (它一定要签名身份+描述文件),
+          # 直接按 ipa 规范打 Payload/ zip —— 侧载工具会自行重签。
+          APP_PATH="$(find build/iosApp.xcarchive/Products/Applications -maxdepth 1 -name '*.app' | head -1)"
+          test -n "$APP_PATH"
+          rm -rf build/ipa && mkdir -p build/ipa/Payload
+          cp -R "$APP_PATH" build/ipa/Payload/
+          cd build/ipa
+          zip -qry "legado-${{ steps.ver.outputs.version }}-ios-unsigned.ipa" Payload
+          rm -rf Payload
+          ls -lh *.ipa
+          unzip -l *.ipa | head -30
+
+      - name: Upload IPA artifact
+        if: inputs.stage == 'ipa'
+        uses: actions/upload-artifact@v6
+        with:
+          name: ios-ipa-unsigned
+          path: ${{ github.workspace }}/iosApp/build/ipa/*.ipa
+          # IPA 是 stage=ipa 的发布契约；缺失或上传失败必须让工作流失败。
+          if-no-files-found: error
+
+      # 失败时最需要日志, 故 always()
+      - name: Collect logs
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/ci-logs"
+          cp -R "$HOME/.konan/kotlin-native-prebuilt"*/konan/konan.properties "$GITHUB_WORKSPACE/ci-logs/" 2>/dev/null || true
+          find "$GITHUB_WORKSPACE/ui/build/reports" -type f 2>/dev/null | head -50 || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ios-build-logs
+          path: |
+            ${{ github.workspace }}/ci-logs/**
+            ${{ github.workspace }}/ui/build/reports/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # 各步都是 continue-on-error, 这里统一判定成败, 保证一轮跑完能同时看到所有失败点
+      - name: Summarize result
+        if: always()
+        run: |
+          FAILED=0
+          report() {
+            echo "- $1: $2"
+            echo "- $1: $2" >> $GITHUB_STEP_SUMMARY
+            if [ "$2" = "failure" ]; then FAILED=1; fi
+          }
+          echo "## iOS build (stage=${{ inputs.stage }}) 结果" >> $GITHUB_STEP_SUMMARY
+          report "native static libs" "${{ steps.native.outcome || 'skipped' }}"
+          report "sync iOS version" "${{ steps.syncver.outcome || 'skipped' }}"
+          report "compile klib" "${{ steps.klib.outcome || 'skipped' }}"
+          report "link framework" "${{ steps.link.outcome || 'skipped' }}"
+          report "xcodebuild archive" "${{ steps.archive.outcome || 'skipped' }}"
+          report "package ipa" "${{ steps.ipa.outcome || 'skipped' }}"
+          report "simulator build" "${{ steps.simbuild.outcome || 'skipped' }}"
+          report "package simulator" "${{ steps.simzip.outcome || 'skipped' }}"
+          if [ "$FAILED" = "1" ]; then
+            echo "有步骤失败, 详见 ios-build-logs artifact"
+            exit 1
+          fi
+
+  # 手动构建完成后发布到 multiplatform-test 测试 Release: 真机 ipa 重建 Release
+  # (提交与排位刷到最新, 旧资产清空), 模拟器包只追加不动既有资产;
+  # klib/link 是调试档无产物, 不发布。
+  publish-multiplatform-test:
+    needs: ios
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.stage == 'ipa' || inputs.stage == 'simulator') }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/_publish.yml
+    with:
+      tag: multiplatform-test
+      artifact-name-pattern: ${{ inputs.stage == 'simulator' && 'ios-simulator' || 'ios-ipa-unsigned' }}
+      # 测试包不得抢占 releases/latest: 正式版链接要停在含安卓与桌面安装件的版本上
+      prerelease: true
+      name: multiplatform-test

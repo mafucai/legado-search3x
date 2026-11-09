@@ -1,0 +1,257 @@
+name: Test Build
+
+on:
+  push:
+    branches:
+      - '**'
+    # 文档/资源类变更不触发完整 beta 构建发布
+    paths-ignore:
+      - '**.md'
+      - '**/assets/**'
+      - '**/ISSUE_TEMPLATE/**'
+      - '**/modules/web/**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - '**/assets/**'
+      - '**/ISSUE_TEMPLATE/**'
+      - '**/modules/web/**'
+  workflow_run:
+    workflows: [Build Web]
+    branches: [ '**' ]
+    types:
+      - completed
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 默认最小权限; 需要写 Release/tag 的只有 publish job
+permissions:
+  contents: read
+
+jobs:
+
+  prepare:
+    runs-on: ubuntu-latest
+    if: ${{ !startsWith(github.event.head_commit.message, 'Merge pull request') && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') }}
+    outputs:
+      version: ${{ steps.set-ver.outputs.version }}
+      lanzou: ${{ steps.check.outputs.lanzou }}
+      telegram: ${{ steps.check.outputs.telegram }}
+    steps:
+      - id: set-ver
+        run: |
+          echo "version=$(date -d "8 hour" -u +3.%y.%m%d%H%M)" >> $GITHUB_OUTPUT
+      - id: check
+        # secret 走 env 而非表达式内插: 值里的引号/换行拼不坏这段脚本
+        env:
+          LANZOU_ID: ${{ secrets.LANZOU_ID }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          [ -z "$LANZOU_ID" ] || echo "lanzou=yes" >> $GITHUB_OUTPUT
+          [ -z "$BOT_TOKEN" ] || echo "telegram=yes" >> $GITHUB_OUTPUT
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    # 发布收口到 publish job, 本 job 只需只读权限 (默认)
+    env:
+      product: app
+      VERSION: ${{ needs.prepare.outputs.version }}
+      GRADLE_ARGS: --build-cache --parallel --daemon --warning-mode all
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: 21
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+      - name: Gradle build-cache 共享
+        # key 必须每次运行唯一: GitHub 对已存在的 key 跳过保存, 固定 key 会让缓存自首次写入后永久冻结;
+        # 取用走 restore-keys 前缀 (同 OS 同分支最近一次), 运行结束把整个目录存成新 key
+        uses: actions/cache@v5
+        with:
+          path: ~/.gradle/caches/build-cache-1
+          key: gradle-buildcache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          restore-keys: |
+            gradle-buildcache-${{ runner.os }}-${{ github.ref_name }}-
+            gradle-buildcache-${{ runner.os }}-
+
+      - name: Release Apk Sign
+        # 测试发布与 release.yml 正式发布统一使用同一正式签名密钥 (RELEASE_KEY_STORE secret 注入,
+        # 注入方式与 release.yml 逐字同源), beta 包与正式包可直接互相覆盖安装。
+        env:
+          RS_FILE: ${{ secrets.RELEASE_KEY_STORE }}
+          RS_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RS_KEY_PASS: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          RS_STORE_PASS: ${{ secrets.RELEASE_STORE_PASSWORD }}
+        run: |
+          echo "给apk增加签名"
+          echo -e "\n" >> gradle.properties
+          echo RELEASE_KEY_ALIAS="$RS_ALIAS" >> gradle.properties
+          echo RELEASE_KEY_PASSWORD="$RS_KEY_PASS" >> gradle.properties
+          echo RELEASE_STORE_PASSWORD="$RS_STORE_PASS" >> gradle.properties
+          echo RELEASE_STORE_FILE='./key.jks' >> gradle.properties
+          echo "$RS_FILE" | python3 -c "import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read().strip()))" > $GITHUB_WORKSPACE/app/key.jks
+
+      - name: Build Release (原包名)
+        run: |
+          echo "开始${{ env.product }}原包名构建"
+          chmod +x gradlew
+          ./gradlew assemble${{ env.product }}release -PappVersion=$VERSION $GRADLE_ARGS
+          echo "收集APK"
+          mkdir -p apk/
+          find app/build/outputs/renamed-apks -name "*.apk" -exec mv {} apk/ \;
+
+      - name: Release Note & Tag
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "## 更新日志" > RELEASE_NOTES.md
+          if [ "${{ github.ref_name }}" != "master" ]; then
+            echo "⚠️ **注意：当前分支为 ${{ github.ref_name }}，包含实验性功能，可能有破坏性变更。**" >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+          fi
+          # 新分支首推/force-push 时 event.before 是 40 个 0 或已不存在, git log 会 fatal: bad object
+          # 拖挂整个 build; 校验通不过就退回最近 10 条
+          BEFORE="${{ github.event.before }}"
+          if [ "${{ github.event_name }}" == "push" ] && git rev-parse --verify -q "$BEFORE^{commit}" >/dev/null; then
+            git log "$BEFORE..${{ github.event.after }}" --pretty=format:"- %<(72,trunc)%s (%h)" | head -20 >> RELEASE_NOTES.md
+          else
+            git log -10 --pretty=format:"- %<(72,trunc)%s (%h)" >> RELEASE_NOTES.md
+          fi
+
+      # 发布在 publish job (_publish.yml), 这里只把更新日志传上去
+      - name: Upload Release Notes
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-notes
+          path: RELEASE_NOTES.md
+          if-no-files-found: ignore
+
+      - name: Post (原包名) to Telegram
+        # 时序在共存构建前: 此时 apk/ 仅含原包名产物, 通配不会带出共存包
+        if: github.event_name != 'pull_request' && needs.prepare.outputs.telegram == 'yes'
+        uses: xireiki/channel-post@v1
+        with:
+          chat_id: ${{ secrets.CHANNEL_ID }}
+          bot_token: ${{ secrets.BOT_TOKEN }}
+          context: |
+            #阅读 #Legado #Beta ${{ env.VERSION }} (原包名)
+            ${{ github.ref_name != 'master' && format('⚠️ 实验性分支: {0}', github.ref_name) || '' }}
+          path: apk/*.apk
+          method: sendFile
+
+      # --- 接着编译共存版 ---
+      - name: Build ReleaseA (共存)
+        # -PcoexistBuild=true 一并决定 applicationIdSuffix (.releaseA) 与 APK 名后缀 (_releaseA);
+        # 后者是应用内更新识别渠道变体的依据 (AppReleaseInfo), 也让两个变体产物不互相覆盖
+        # -x lintVitalAppRelease: 共存版与原包名同一份源码、同一个工作区, lint 只看源码与依赖,
+        # 两遍结论相同; 实测该 lint 单次 2~11 分钟 (安卓构建耗时的一半以上), 不重复跑
+        run: |
+          echo "开始${{ env.product }}共存构建"
+          ./gradlew assemble${{ env.product }}release -PappVersion=$VERSION -PcoexistBuild=true -x lintVitalAppRelease $GRADLE_ARGS
+          echo "收集共存版APK"
+          find app/build/outputs/renamed-apks -name "*.apk" -exec mv {} apk/ \;
+
+      # 两个变体构建完后一次上传 (原包名 + 共存), 不再分两次
+      - name: Upload Artifacts (原包名 + 共存)
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.product }}.apk
+          path: apk/*.apk
+          # 一个 APK 都没搬到就当场失败: 否则 publish 会发出一个只有更新日志的空 Release
+          if-no-files-found: error
+
+      # 合并原两次蓝奏上传为一次: 此时 apk/ 含两个变体全部产物
+      - name: Upload To Lanzou (原包名 + 共存)
+        if: github.event_name != 'pull_request' && needs.prepare.outputs.lanzou == 'yes'
+        continue-on-error: true
+        run: |
+          python3 .github/scripts/lzy_web.py "${{ github.workspace }}/apk/" "${{ secrets.LANZOU_FOLDER_ID }}"
+        env:
+          ylogin: ${{ secrets.LANZOU_ID }}
+          phpdisk_info: ${{ secrets.LANZOU_PSD }}
+
+      - name: Post (共存) to Telegram
+        if: github.event_name != 'pull_request' && needs.prepare.outputs.telegram == 'yes'
+        uses: xireiki/channel-post@v1
+        with:
+          chat_id: ${{ secrets.CHANNEL_ID }}
+          bot_token: ${{ secrets.BOT_TOKEN }}
+          context: |
+            #阅读 #Legado #Beta ${{ env.VERSION }} (共存)
+            ${{ github.ref_name != 'master' && format('⚠️ 实验性分支: {0}', github.ref_name) || '' }}
+          path: apk/*releaseA*.apk
+          method: sendFile
+
+  # ===== 桌面三端 MSI/便携zip/DEB/RPM/DMG (与 Android build 并行) =====
+  # 实现在 _desktop.yml, 与 release.yml 共用同一份。
+  desktop:
+    needs: prepare
+    uses: ./.github/workflows/_desktop.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+
+  # ===== 鸿蒙 HAP (CI 不构建, 仅本地; 2026-08-19 查证结论) =====
+  # 决策: 维持本地构建, CI 不建鸿蒙 job。原因链如下 (均已实测查证):
+  #   1. shared .so 需 CPF 工具链: fork 构件仅发布在 maven.eazytec-cloud.com (中国私有 Nexus),
+  #      GitHub-hosted runner 实测不可达, :ui:link*SharedOhosArm64 无法在 CI 跑。
+  #   2. HAP 打包需 HarmonyOS SDK: 华为云公开镜像 (repo.huaweicloud.com/harmonyos/ohpm/) 最高
+  #      commandline-tools 5.1.0.840, 自带 SDK = HarmonyOS 5.1.0 (API 18) + hvigor 5.18.5,
+  #      无 API 24 SDK 公开下载渠道 (DevEco Studio SDK Manager 的 SDK 无公开直链)。
+  #      工程 targetSdkVersion 6.1.1(24) > API 18 (华为规则 targetSdkVersion ≤ compileSdkVersion),
+  #      故参考 DandanLLab/mr build.yml 的华为云镜像方案也无法编译本工程。
+  #   3. compatibleSdkVersion 5.0.0(12) 已是代码/依赖下限, 不可降: ArkTS 全部用 @kit.* 模块
+  #      (API 12 引入) 且 CPF-KMP-CMP (@cpf-kmp-cmp/compose) 仅支持 API 12+。
+  #      (@cpf-kmp-cmp/compose 在 ohpm.openharmony.cn 公开源, 依赖解析不受阻;
+  #       真正卡点仅 ①CPF Kotlin/Native 工具链 ②API 24 SDK 两个。)
+  #
+  # 本地构建 HAP 步骤:
+  #   1. 安装 DevEco Studio: https://developer.huawei.com/consumer/cn/deveco-studio/
+  #   2. DevEco Studio SDK Manager 安装 HarmonyOS SDK 6.1.1 (API 24, 与工程 targetSdkVersion 匹配)
+  #   3. 编译 shared .so 并拷入 entry/libs (root build.gradle.kts 的 stageOhosNativeLibraries
+  #      一站式完成: link release .so + 拷贝 + 生成头文件):
+  #        ./gradlew stageOhosNativeLibraries -PenableOhosTarget=true
+  #      产物 ui/build/bin/ohosArm64/releaseShared/liblegado_shared.so → ohosApp/entry/libs/arm64-v8a/
+  #   4. 配置签名 (二选一):
+  #      a) 调试签名: DevEco Studio 自动生成临时调试证书, 直接 Build → Build Hap(s)/APP(s) 即可
+  #      b) 发布签名: 在 ohosApp/build-profile.json5 的 signingConfigs 数组填入 material.storeFile/cert
+  #   5. 命令行打包 (仓库未提交 hvigorw 包装脚本, 用 DevEco Studio 内置 hvigorw, 在 ohosApp/ 目录下):
+  #        # Windows: "D:/soft/DevEco Studio/tools/hvigor/bin/hvigorw.bat" (路径按本机安装位置)
+  #        # Linux/macOS: $DEVECO_HOME/tools/hvigor/bin/hvigorw
+  #        hvigorw assembleHap --mode module -p product=default --no-daemon
+  #   6. 产物路径:
+  #      - 未签名: ohosApp/entry/build/default/outputs/default/entry-default-unsigned.hap
+  #      - 已签名: ohosApp/entry/build/default/outputs/default/entry-default-signed.hap
+  #
+  # 上面第 3 步 (shared .so + 头文件) 已封装为 scripts/build-ohos-native.sh, 本地与
+  # 自托管 runner 均可直接调用: 脚本只做前置检查 + 转调既有的 verifyOhosNativeLibraries
+  # 任务 (dependsOn stageOhosNativeLibraries 并自带产物校验), 不引入任何新的外部服务与密钥。
+  # 产物与 hvigorw 打包步骤的对应关系见该脚本头部注释。
+  #
+  # 如未来 CI 想跑 HAP: 需自托管 runner (可访问 eazytec + 预装 API 24 SDK 与签名材料),
+  # 加一个 runs-on: [self-hosted, harmonyos] 的 job 跑上面第 5 步并 upload-artifact 即可
+  # (华为云镜像下载 commandline-tools 方案对 API 24 工程不适用)。
+  # 本仓库当前没有任何 runs-on: [self-hosted, ...] 的既有 job 可照抄, 上面是唯一配方。
+
+  # ===== 统一发布 beta release (全部产物) =====
+  # 等 Android + 桌面三端跑完后一次性发布, 把 APK/MSI/portable zip/DEB/RPM/DMG 全挂上去。
+  publish:
+    needs: [ prepare, build, desktop ]
+    # !cancelled(): 桌面某一端挂了也要把已成功的产物发出去; Android 没出包则不发
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.build.result == 'success' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/_publish.yml
+    with:
+      tag: beta
+      name: ${{ needs.prepare.outputs.version }}
+      prerelease: true
+

@@ -1,0 +1,178 @@
+name: Desktop packages
+
+# release.yml / test.yml 共用的桌面三端打包链: 只产 artifact, 不写 Release
+# (发布统一收口到 _publish.yml, 避免多 job 并发写同一 tag)。
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: '注入 packageVersion 的版本号 (如 3.26.0901)'
+        required: true
+        type: string
+
+# 三端统一 bash, 收集脚本才能只写一份。路径一律用 $GITHUB_WORKSPACE 或相对路径:
+# ${{ github.workspace }} 是表达式, 在 bash 解析前就贴进脚本, Windows 上的反斜杠
+# (D:\a\...) 会被当转义吃掉 (实测报过 find: 'D:alegadolegado/...' No such file)。
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  package:
+    strategy:
+      # 一端挂了不连累另两端
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            # Git Bash 下走 .bat: 沿用原生 Windows 启动路径。注意 gradlew 的路径转换块
+            # 对 cygwin 与 msys 都生效 (uname 的 MSYS*/MINGW* 分支会置 msys, 并与 cygwin
+            # 共用同一个 cygpath 转换分支), 故原「只认 cygwin / 缺 msys 分支」的说法不成立。
+            # 仍选 .bat 是有意保留 (完全绕开 cygpath 转换), 但改用 sh 版是否真会报
+            # Could not find or load main class 未查证。
+            gradlew: ./gradlew.bat
+            # packagePortableZip 仅 Windows 有 (onlyIf), 复用 createReleaseDistributable
+            # 产物 (packageReleaseMsi 上游), 仅打 zip 不经安装器
+            tasks: ':desktop:packageReleaseMsi :desktop:packagePortableZip'
+          - os: ubuntu-latest
+            gradlew: ./gradlew
+            tasks: ':desktop:packageReleaseDeb :desktop:packageReleaseRpm'
+          - os: macos-latest
+            gradlew: ./gradlew
+            tasks: ':desktop:packageReleaseDmg'
+    runs-on: ${{ matrix.os }}
+    env:
+      APP_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: 21
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+      - name: Gradle build-cache 共享
+        # key 必须每次运行唯一: GitHub 对已存在的 key 跳过保存, 固定 key 会让缓存自首次写入后永久冻结;
+        # 取用走 restore-keys 前缀 (同 OS 同分支最近一次), 各端 runner 共享同一份缓存
+        uses: actions/cache@v5
+        with:
+          path: ~/.gradle/caches/build-cache-1
+          key: gradle-buildcache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          restore-keys: |
+            gradle-buildcache-${{ runner.os }}-${{ github.ref_name }}-
+            gradle-buildcache-${{ runner.os }}-
+
+      - name: Install Linux packaging deps
+        # jpackage 打 deb 需要 dpkg-deb, 打 rpm 需要 rpmbuild; ubuntu-latest 默认无 rpmbuild
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev rpm
+
+      - name: Package
+        # Gradle 打包任务图负责构建并复制 QuickJS native，CI 不再提前重复执行其构建任务。
+        # release buildType: 官方 ProGuard 集成仅 release 链启用 (proguardReleaseJars), default 链不瘦身
+        run: ${{ matrix.gradlew }} ${{ matrix.tasks }} -PappVersion=$APP_VERSION --build-cache --parallel --daemon --warning-mode all
+
+      - name: Collect jpackage logs
+        if: failure()
+        # jpackage 的真实报错只落在 desktop/build/compose/logs/<task>/jpackage-*-out|err.txt,
+        # Gradle 的失败信息只给文件路径不给内容 (2026-09-11 Windows MSI 实测: 整条 CI 日志里
+        # 只有 "External tool execution failed / Exit code: 1", 根因完全不可见)。这里把整个
+        # logs 目录 + jpackage 参数文件 (tmp/*.args.txt) 收进 ci-logs, 并 tail 到日志里直接可读。
+        run: |
+          mkdir -p ci-logs
+          logs=desktop/build/compose/logs
+          if [ -d "$logs" ]; then
+            while IFS= read -r -d '' f; do
+              echo "===== $f ====="
+              tail -n 200 "$f"
+            done < <(find "$logs" -type f -print0) | tee ci-logs/jpackage-tail.txt
+            cp -R "$logs" ci-logs/compose-logs
+          else
+            echo "::warning::no jpackage log dir at $logs (failure happened before jpackage was invoked)"
+          fi
+          for args in desktop/build/compose/tmp/*.args.txt; do
+            [ -f "$args" ] || continue
+            echo "===== $args ====="
+            cat "$args" | tee -a ci-logs/jpackage-args.txt
+            cp "$args" "ci-logs/$(basename "$args")"
+          done
+          ls -lR ci-logs/
+
+      - name: Upload jpackage logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: desktop-logs-${{ runner.os }}
+          path: ci-logs/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Verify final app image quickjs library
+        # 校验 jpackage 最终 app-image（安装器和便携包的共同输入），不接受仅资源输入目录有库。
+        run: |
+          case "$RUNNER_OS" in
+            Windows) lib=legado_quickjs.dll ;;
+            macOS)   lib=liblegado_quickjs.dylib ;;
+            *)       lib=liblegado_quickjs.so ;;
+          esac
+          app_images="desktop/build/compose/binaries/main-release/app"
+          test -d "$app_images"
+          matches=()
+          while IFS= read -r -d '' file; do matches+=("$file"); done < <(find "$app_images" -type f -name "$lib" -print0)
+          if [ "${#matches[@]}" -eq 0 ]; then
+            echo "::error::QuickJS library $lib is missing from final app image tree: $app_images"
+            exit 1
+          fi
+          printf 'Verified packaged QuickJS library: %s\n' "${matches[@]}"
+
+      - name: Collect packages
+        # 统一命名: 平台_架构[_特殊版本].扩展名, 不带版本号; 包内 packageVersion 仍是实际版本,
+        # 应用内更新按「后缀 + 架构标记」匹配资产 (UpdatePlatform)。
+        # jpackage 内部架构名 (amd64/x86_64/aarch64) 对外统一叫 x64/arm64。
+        # 搜索根取整个 binaries 目录: release 链的 buildType 目录名带 classifier (main-release/msi),
+        # 全目录 find 避免路径变化再踩坑。非本平台的模式自然找不到, 一份脚本三端通用。
+        run: |
+          mkdir -p dist
+          collect() {  # <搜索根> <find 模式> <统一产物名>
+            [ -d "$1" ] || return 0
+            find "$1" -name "$2" -exec mv {} "dist/$3" \;
+          }
+          collect desktop/build/compose/binaries '*.msi' windows_x64.msi
+          collect desktop/build/compose/binaries '*.deb' linux_x64.deb
+          collect desktop/build/compose/binaries '*.rpm' linux_x64.rpm
+          collect desktop/build/compose/binaries '*.dmg' macos_arm64.dmg
+          collect desktop/build/outputs/portable  '*.zip' windows_x64_portable.zip
+          ls -lh dist/
+
+      - name: Verify required packages
+        # 逐 runner 校验完整契约，不能用“任意一个产物存在”掩盖某种格式漏包。
+        run: |
+          case "$RUNNER_OS" in
+            Windows) required=(windows_x64.msi windows_x64_portable.zip) ;;
+            Linux)   required=(linux_x64.deb linux_x64.rpm) ;;
+            macOS)   required=(macos_arm64.dmg) ;;
+            *)
+              echo "::error::Unsupported runner OS: $RUNNER_OS"
+              exit 1
+              ;;
+          esac
+          failed=0
+          for package in "${required[@]}"; do
+            if [ ! -s "dist/$package" ]; then
+              echo "::error::Missing or empty required desktop package: dist/$package"
+              failed=1
+            fi
+          done
+          [ "$failed" -eq 0 ]
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v6
+        with:
+          name: desktop-${{ runner.os }}
+          path: dist/*
+          if-no-files-found: error

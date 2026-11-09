@@ -1,0 +1,173 @@
+name: Release Build
+
+on:
+  schedule:
+    - cron: '0 0 1,15 * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'release=完整正式发布'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+
+# 定时/手动触发时, 同一分支只跑一个实例, 取消旧实例避免重复 Release
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 默认最小权限; 需要写 Release/tag 的只有 publish job
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.set-ver.outputs.version }}
+      sign: ${{ steps.check.outputs.sign }}
+    steps:
+      - id: set-ver
+        run: |
+          echo "version=$(date -d "8 hour" -u +3.%y.%m%d%H)" >> $GITHUB_OUTPUT
+      - id: check
+        # 没配正式签名 secret 就整条链路不跑, 避免发出 debug 签名的「正式版」。
+        # secret 走 env 而非表达式内插: 值里的引号/换行拼不坏这段脚本
+        env:
+          RELEASE_KEY_STORE: ${{ secrets.RELEASE_KEY_STORE }}
+        run: |
+          [ -z "$RELEASE_KEY_STORE" ] || echo "sign=yes" >> $GITHUB_OUTPUT
+
+  build:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.sign && (github.event_name != 'workflow_dispatch' || inputs.mode == 'release') }}
+    runs-on: ubuntu-latest
+    # 发布收口到 publish job, 本 job 只需只读权限 (默认)
+    env:
+      product: app
+      VERSION: ${{ needs.prepare.outputs.version }}
+      GRADLE_ARGS: --build-cache --parallel --daemon --warning-mode all
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: 21
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+      - name: Gradle build-cache 共享
+        # key 必须每次运行唯一: GitHub 对已存在的 key 跳过保存, 固定 key 会让缓存自首次写入后永久冻结;
+        # 取用走 restore-keys 前缀 (同 OS 同分支最近一次), 运行结束把整个目录存成新 key
+        uses: actions/cache@v5
+        with:
+          path: ~/.gradle/caches/build-cache-1
+          key: gradle-buildcache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          restore-keys: |
+            gradle-buildcache-${{ runner.os }}-${{ github.ref_name }}-
+            gradle-buildcache-${{ runner.os }}-
+
+      - name: Release Apk Sign
+        env:
+          RS_FILE: ${{ secrets.RELEASE_KEY_STORE }}
+          RS_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RS_KEY_PASS: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          RS_STORE_PASS: ${{ secrets.RELEASE_STORE_PASSWORD }}
+        run: |
+          echo -e "\n" >> gradle.properties
+          echo RELEASE_KEY_ALIAS="$RS_ALIAS" >> gradle.properties
+          echo RELEASE_KEY_PASSWORD="$RS_KEY_PASS" >> gradle.properties
+          echo RELEASE_STORE_PASSWORD="$RS_STORE_PASS" >> gradle.properties
+          echo RELEASE_STORE_FILE='./key.jks' >> gradle.properties
+          echo "$RS_FILE" | python3 -c "import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read().strip()))" > $GITHUB_WORKSPACE/app/key.jks
+
+      - name: Build Release (原包名)
+        run: |
+          echo "开始${{ env.product }}原包名构建"
+          chmod +x gradlew
+          ./gradlew assemble${{ env.product }}release -PappVersion=$VERSION $GRADLE_ARGS
+          echo "收集APK"
+          mkdir -p apk/
+          find app/build/outputs/renamed-apks -name "*.apk" -exec mv {} apk/ \;
+
+      - name: Build ReleaseA (共存)
+        # -PcoexistBuild=true 一并决定 applicationIdSuffix (.releaseA) 与 APK 名后缀 (_releaseA);
+        # 后者是应用内更新识别渠道变体的依据 (AppReleaseInfo), 也让两个变体产物不互相覆盖
+        run: |
+          echo "开始${{ env.product }}共存构建"
+          ./gradlew assemble${{ env.product }}release -PappVersion=$VERSION -PcoexistBuild=true $GRADLE_ARGS
+          echo "收集共存版APK"
+          find app/build/outputs/renamed-apks -name "*.apk" -exec mv {} apk/ \;
+
+      - name: Generate Release Notes
+        # 取样窗口对齐 cron (每月 1/15 号): 列最近 15 天提交, 超 25 条只报条数并给 compare 链接
+        run: |
+          echo "## 更新日志" > RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          COMMITS=$(git log --since="15 days ago" --pretty=format:"- %<(72,trunc)%s (%h)")
+          OLDEST=$(git log --since="15 days ago" --format="%H" | tail -1)
+          BASE=$(git rev-parse "${OLDEST}^" 2>/dev/null || echo "$OLDEST")
+          COMPARE_URL="https://github.com/${{ github.repository }}/compare/${BASE}...HEAD"
+
+          if [ -n "$COMMITS" ]; then
+            echo "$COMMITS" | head -25 >> RELEASE_NOTES.md
+            TOTAL=$(echo "$COMMITS" | wc -l)
+            if [ "$TOTAL" -gt 25 ]; then
+              echo "- *……还有 $((TOTAL - 25)) 条提交未显示*" >> RELEASE_NOTES.md
+            fi
+            echo "" >> RELEASE_NOTES.md
+            echo "[查看完整提交记录 →](${COMPARE_URL})" >> RELEASE_NOTES.md
+          else
+            echo "- 定期维护编译，无代码变更。" >> RELEASE_NOTES.md
+          fi
+          cat RELEASE_NOTES.md
+
+      # 发布在 publish job (_publish.yml), 这里只把产物与更新日志传上去
+      - name: Upload Release Notes
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-notes
+          path: RELEASE_NOTES.md
+          if-no-files-found: ignore
+
+      - name: Upload Artifacts (原包名 + 共存)
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.product }}.apk
+          path: apk/*.apk
+          # 一个 APK 都没搬到就当场失败: 否则 publish 会发出一个只有更新日志的空 Release
+          if-no-files-found: error
+  # ===== 桌面三端 MSI/便携zip/DEB/RPM/DMG (与 Android build 并行) =====
+  # 实现在 _desktop.yml, 与 test.yml 共用同一份
+  desktop:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.sign && (github.event_name != 'workflow_dispatch' || inputs.mode == 'release') }}
+    uses: ./.github/workflows/_desktop.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+
+  # ===== 鸿蒙 =====
+  # CI 不构建 (CPF 工具链在私有 Nexus 不可达 + 无 API 24 SDK 公开渠道)。
+  # 查证结论与本地构建步骤见 test.yml 的鸿蒙注释块; shared 库 (.so + 头文件) 已封装为
+  # scripts/build-ohos-native.sh (本地/自托管 runner 可用)。.so/HAP 需随 Release 发布时
+  # 本地手动上传。
+
+  # ===== 统一发布正式 Release (iOS 不在本流水线: 手动触发 ios.yml 自产出包) =====
+  publish:
+    needs: [ prepare, build, desktop ]
+    # 正式模式以 Android 成功为发布前提。
+    # always() 让 publish 在可选桌面失败后仍可发布已有产物；条件仍要求关键 job 成功。
+    if: ${{ always() && ((github.event_name != 'workflow_dispatch' || inputs.mode == 'release') && needs.build.result == 'success') }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/_publish.yml
+    with:
+      tag: ${{ needs.prepare.outputs.version }}
+      artifact-name-pattern: '*'
+      name: ${{ needs.prepare.outputs.version }}
+      prerelease: false
+

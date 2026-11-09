@@ -1,0 +1,82 @@
+name: Build Web
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - '**/modules/web/**'
+  pull_request:
+    paths:
+      - '**/modules/web/**'
+  workflow_dispatch:
+
+# 同分支只跑一个实例, 避免两次 web 构建并发 auto-commit 打架
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # git-auto-commit-action 需要回写仓库
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: pnpm/action-setup@v4
+        name: Install pnpm
+        id: pnpm-install
+        with:
+          version: 9
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
+
+      - uses: actions/cache@v5
+        name: Setup pnpm cache
+        with:
+          # pnpm-lock.yaml 已存在且被 git 跟踪 (modules/web/pnpm-lock.yaml), 具备锁版本条件;
+          # 但 key 只 hash package.json 且下面用 pnpm i (无 --frozen-lockfile), 依赖版本仍可能漂。
+          # 要真正可复现构建: 改成 hashFiles('**/web/pnpm-lock.yaml') + pnpm i --frozen-lockfile。
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/web/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Build and move files
+        working-directory: modules/web
+        run: |
+          pnpm i
+          # 确保使用生产模式构建，启用代码压缩和优化
+          # 产物落位由 package.json 的 build 脚本末尾 node ./scripts/sync.js 负责,
+          # 同步到 ui/src/commonMain/composeResources/files/web/ (即下方 file_pattern)
+          NODE_ENV=production pnpm build
+          # 显示构建产物大小
+          echo "构建产物大小："
+          du -sh dist/
+          version="v$(date -d "8 hour" -u +3.%y.%m%d%H)"
+          echo "APP_VER=$version" >> $GITHUB_ENV
+
+      - name: push changes
+        if: ${{ github.event_name != 'pull_request'}}
+        uses: stefanzweifel/git-auto-commit-action@v5.1.0
+        with:
+          commit_message: Bump web ${{ env.APP_VER}}
+          file_pattern: ui/src/commonMain/composeResources/files/web/
+

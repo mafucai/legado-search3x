@@ -1,0 +1,120 @@
+name: Publish release
+
+# _publish.yml 是全部发布路径共用的收口 (三个调用方: test.yml 出 beta, release.yml 出正式,
+# ios.yml 手动发包到 multiplatform-test): 只读 artifact 目录并一次性建 Release。
+# 单发布者是刻意设计 —— 多 job 各自 allowUpdates 写同一 tag 会撞 already_exists,
+# 且后来者不带 bodyFile 会把更新日志清空 (旧实现靠 omitBodyDuringUpdate 逐处打补丁)。
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag; test.yml 固定 beta, release.yml 正式用版本号、ios.yml 手动发布用 multiplatform-test'
+        required: true
+        type: string
+      artifact-name-pattern:
+        description: '下载 artifact 的名称 glob；可将手动 iOS beta 限定到专用 artifact'
+        required: false
+        default: '*'
+        type: string
+      name:
+        description: 'Release 标题 (版本号)'
+        required: true
+        type: string
+      prerelease:
+        description: '是否标记为预发布'
+        required: false
+        default: false
+        type: boolean
+
+# 同一目标 tag 的所有写入（统一发布与 iOS 手动追加）共用一把锁。
+concurrency:
+  group: publish-release-${{ github.repository }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # 删除/重建 Release 需要写权限 (仓库默认 token 只读); 调用方也要在 job 上放开同一权限
+    permissions:
+      contents: write
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          pattern: ${{ inputs.artifact-name-pattern }}
+          merge-multiple: true
+
+      - name: Verify downloaded release artifacts
+        run: |
+          shopt -s nullglob
+          files=(artifacts/*)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No release artifact matched '${{ inputs.artifact-name-pattern }}'"
+            exit 1
+          fi
+
+      - name: Exclude simulator builds from formal release
+        # 模拟器包只进 multiplatform-test 测试 Release, 正式发布剔除
+        if: inputs.artifact-name-pattern == '*'
+        run: rm -fv artifacts/*-ios-simulator.zip
+
+      - name: Delete Old Release
+        # 正式发布保持重建语义；iOS 手动发布不走这里，在下方单独重建 multiplatform-test。
+        if: inputs.artifact-name-pattern == '*'
+        continue-on-error: true
+        run: gh release delete "${{ inputs.tag }}" -y --cleanup-tag --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Publish Release (全产物)
+        # iOS-only beta 只追加 IPA，保留 beta 现有 APK/桌面资产与正文。
+        if: inputs.artifact-name-pattern == '*'
+        uses: ncipollo/release-action@v1
+        with:
+          name: ${{ inputs.name }}
+          tag: ${{ inputs.tag }}
+          # 更新日志由 Android build job 以 release-notes artifact 传来
+          bodyFile: artifacts/RELEASE_NOTES.md
+          prerelease: ${{ inputs.prerelease }}
+          allowUpdates: true
+          removeArtifacts: true
+          artifacts: "artifacts/*.apk,artifacts/*.msi,artifacts/*.zip,artifacts/*.deb,artifacts/*.rpm,artifacts/*.dmg,artifacts/*.ipa"
+
+      - name: Publish iOS assets to multiplatform-test
+        if: inputs.artifact-name-pattern != '*'
+        run: |
+          shopt -s nullglob
+          files=(artifacts/*.ipa artifacts/*-ios-simulator.zip)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::Downloaded artifact contains no IPA or simulator zip"
+            exit 1
+          fi
+          TAG="${{ inputs.tag }}"
+          # 预发布标记沿用 inputs.prerelease, 与全产物发布路径同一语义:
+          # multiplatform-test 不保持预发布就会被 GitHub 当成 latest, releases/latest 漂到只含
+          # ipa/hap 的版本上, README 的桌面/安卓下载链接取不到安装件。
+          PRERELEASE_FLAG=""
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          if [ "${{ inputs.artifact-name-pattern }}" = "ios-ipa-unsigned" ]; then
+            # 真机 ipa 发包: 删除 Release+tag 重建, tag 指向触发时 HEAD, 提交与排位都刷到最新;
+            # 重建清空全部旧资产 (模拟器包与手动上传的 hap 需重新上传), 正文原样写回
+            BODY="$(gh release view "$TAG" --repo "$GH_REPO" --json body --jq .body 2>/dev/null || true)"
+            [ -n "$BODY" ] || BODY="iOS 未签名 ipa (SideStore/AltStore 自签侧载) 与模拟器构建包"
+            gh release delete "$TAG" -y --cleanup-tag --repo "$GH_REPO" || true
+            gh release create "$TAG" --target "${{ github.sha }}" --repo "$GH_REPO" \
+              --title "${{ inputs.name }}" --notes "$BODY" $PRERELEASE_FLAG
+          else
+            # 模拟器包发包: 只上传不动 Release 与既有资产 (ios-remote 按资产名排序取最新)
+            gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1 || \
+              gh release create "$TAG" --repo "$GH_REPO" \
+                --title "${{ inputs.name }}" \
+                --notes "iOS 未签名 ipa (SideStore/AltStore 自签侧载) 与模拟器构建包" $PRERELEASE_FLAG
+          fi
+          gh release upload "$TAG" "${files[@]}" --repo "$GH_REPO" --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # 本 workflow 无 checkout；显式绑定调用方仓库，禁止 gh 从当前目录猜测目标。
+          GH_REPO: ${{ github.repository }}
