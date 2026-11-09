@@ -1,28 +1,7 @@
 name: Test Build
 
 on:
-  push:
-    branches:
-      - '**'
-    # 文档/资源类变更不触发完整 beta 构建发布
-    paths-ignore:
-      - '**.md'
-      - '**/assets/**'
-      - '**/ISSUE_TEMPLATE/**'
-      - '**/modules/web/**'
-  pull_request:
-    paths-ignore:
-      - '**.md'
-      - '**/assets/**'
-      - '**/ISSUE_TEMPLATE/**'
-      - '**/modules/web/**'
-  workflow_run:
-    workflows: [Build Web]
-    branches: [ '**' ]
-    types:
-      - completed
   workflow_dispatch:
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
