@@ -64,7 +64,11 @@ jobs:
         id: apk
         run: |
           set -euo pipefail
-          APK=$(find app/build/outputs/apk/debug -name '*.apk' | head -1)
+          # 产物实际落在 app/build/outputs/apk/app/debug/（带 productFlavor=app 子目录）。
+          # 优先取 arm64 单架构包（体积小一半），没有再退 universal。
+          APK=$(find app/build/outputs/apk -name '*-arm64-v8a-debug.apk' | head -1)
+          [ -n "$APK" ] || APK=$(find app/build/outputs/apk -name '*universal-debug.apk' | head -1)
+          [ -n "$APK" ] || APK=$(find app/build/outputs/apk -name '*.apk' | head -1)
           test -f "$APK" || { echo "没有找到 APK"; exit 1; }
           NAME="legado-search3x-debug.apk"
           cp "$APK" "$NAME"
