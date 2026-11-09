@@ -76,11 +76,9 @@ jobs:
           echo "sha256=$(sha256sum "$NAME" | cut -d' ' -f1)" >> $GITHUB_OUTPUT
           ls -lh "$NAME"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: legado-search3x-debug
-          path: ${{ steps.apk.outputs.name }}
-          retention-days: 14
+      # 不传 artifact: 本账号 Actions artifact 存储配额已满
+      # (run 42654276277: "Artifact storage quota has been hit")。
+      # 直接走 Release asset —— 免登录直链、可断点续传, 也不占 artifact 配额。
 
       # 同步发到 Release，主人可以直接拿免登录直链下载
       - name: Publish Release asset
