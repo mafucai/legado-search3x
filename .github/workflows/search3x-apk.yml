@@ -30,7 +30,7 @@ jobs:
           distribution: temurin
           java-version: '21'          # 与 gradle.properties 的 JVM 设置匹配
 
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
 
       # 项目 compileSdk=37 / AGP 9.4.1：按工程实际需要装平台与构建工具
       - name: Install SDK platform
