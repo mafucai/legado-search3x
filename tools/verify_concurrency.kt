@@ -6,7 +6,7 @@
 //   ChangeBookSource / ChangeCover / ReaderScreen = min(platform.threadCount, MAX_SEARCH_THREAD)
 
 const val MAX_THREAD = 9
-const val MAX_SEARCH_THREAD = 27
+const val MAX_SEARCH_THREAD = 54
 
 fun searchConcurrency(t: Int): Int = if (t < MAX_SEARCH_THREAD) t else MAX_SEARCH_THREAD
 fun oldConcurrency(t: Int): Int = if (t < MAX_THREAD) t else MAX_THREAD
@@ -16,21 +16,21 @@ fun main() {
     var bits = 0
     var i = 0
 
-    // 1) 默认 27 -> 并发 27
-    if (searchConcurrency(27) == 27) bits = bits or (1 shl i); i++
-    // 2) 默认 27 相对旧 9 正好 3 倍
-    if (oldConcurrency(27) * 3 == searchConcurrency(27)) bits = bits or (1 shl i); i++
+    // 1) 默认 54 -> 并发 54
+    if (searchConcurrency(54) == 54) bits = bits or (1 shl i); i++
+    // 2) 默认 54 相对旧 9 正好 6 倍
+    if (oldConcurrency(54) * 6 == searchConcurrency(54)) bits = bits or (1 shl i); i++
     // 3) 用户设 9 -> 只用 9
     if (searchConcurrency(9) == 9) bits = bits or (1 shl i); i++
     // 4) 用户设 16 -> 用 16
     if (searchConcurrency(16) == 16) bits = bits or (1 shl i); i++
-    // 5) 用户设 999 -> 封顶 27
-    if (searchConcurrency(999) == 27) bits = bits or (1 shl i); i++
+    // 5) 用户设 999 -> 封顶 54
+    if (searchConcurrency(999) == 54) bits = bits or (1 shl i); i++
     // 6) 旧口径仍封顶 9
     if (oldConcurrency(999) == 9) bits = bits or (1 shl i); i++
     // 7) 所有档位新 >= 旧（不会变慢）
     var notSlower = true
-    val levels = intArrayOf(1, 9, 16, 20, 27, 50, 999)
+    val levels = intArrayOf(1, 9, 16, 20, 27, 54, 100, 999)
     for (k in levels) if (searchConcurrency(k) < oldConcurrency(k)) notSlower = false
     if (notSlower) bits = bits or (1 shl i); i++
     // 8) 保护闸未被误伤

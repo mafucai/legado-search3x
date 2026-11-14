@@ -1,6 +1,6 @@
 name: Search3x APK
 
-# 目的：只编一个能装的 APK，供主人在手机上验证「换源搜索并发 9→27」的效果。
+# 目的：只编一个能装的 APK，供主人在手机上验证「换源搜索并发 9→54」的效果。
 # 不跑测试、不做签名变更、不碰 release.yml 等原有工作流。
 
 on:
@@ -85,12 +85,12 @@ jobs:
         if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/search3x'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: search3x-debug
-          name: legado 搜索并发 9→27（debug 包）
+          tag_name: search3x-debug-6x
+          name: legado 搜索并发 9→54（debug 包）
           draft: false
           prerelease: true
           body: |
-            书源搜索并发上限 9 → 27（`AppConst.MAX_SEARCH_THREAD`）。
+            书源搜索并发上限 9 → 54（`AppConst.MAX_SEARCH_THREAD`）。
 
             - 只改并发闸门，单源请求/解析/过滤/排序逻辑未动（质量不变）
             - 调试签名：安装前需卸载已装的正式版，或换包名共存

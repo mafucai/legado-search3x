@@ -117,8 +117,8 @@ class SearchModel(private val scope: CoroutineScope, private val callBack: CallB
     private fun initSearchPool(): kotlinx.coroutines.CoroutineDispatcher {
         // 用 limitedParallelism 替代原 Executors.newFixedThreadPool(N).asCoroutineDispatcher()
         // 行为等价: 限制并发到 N, 复用 Dispatchers.IO 线程池, 无需手动 close
-        // 上限用 MAX_SEARCH_THREAD (搜索专用 27), 不用 MAX_THREAD(9): 后者是"同源多章节/图片
-        // 并发抓取"的保护闸, 搜索是跨源扇出, 共用会把全源扫描的排队时间放大 3 倍。
+        // 上限用 MAX_SEARCH_THREAD (搜索专用 54), 不用 MAX_THREAD(9): 后者是"同源多章节/图片
+        // 并发抓取"的保护闸, 搜索是跨源扇出, 共用会把全源扫描的排队时间放大 6 倍。
         return IoDispatcher.limitedParallelism(searchConcurrency)
     }
 
